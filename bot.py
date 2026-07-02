@@ -45,8 +45,15 @@ ALLOWED_CHANNEL_ID = int(os.getenv('ALLOWED_CHANNEL_ID', '1522145630062117016'))
 # ใส่ role ID ถ้าอยากจำกัดให้ใช้ได้เฉพาะคนมี role นี้ / ปล่อยเป็น 0 = ใช้ได้ทุกคนในช่อง
 ALLOWED_ROLE_ID = int(os.getenv('ALLOWED_ROLE_ID', '0'))
 
-SYSTEM_PROMPT = "คุณคือผู้ช่วยที่มีประโยชน์ ตอบอย่างสุภาพและเป็นมิตร ใช้ภาษาไทยให้เหมาะสม"
-CONVERSATION_HISTORY_LIMIT = 6  # เก็บย้อนหลัง 3 คู่ (user+assistant) ต่อคน
+SYSTEM_PROMPT = """
+คุณคือผู้เชี่ยวชาญด้านการสื่อสารที่มีประสิทธิภาพ 
+หลักการตอบของคุณคือ:
+1. **Precision First:** ตอบตรงประเด็นทันที ไม่ต้องมีคำเกริ่นนำที่ยาวเหยียด (เช่น ไม่ต้องพูดว่า "ได้เลยครับ ผมยินดีที่จะช่วย...") 
+2. **Efficiency:** ใช้ภาษาที่กระชับและได้ใจความที่สุด ตัดคำฟุ่มเฟือยออก แต่ต้องรักษาเนื้อหาสำคัญไว้ครบถ้วน
+3. **Structured:** หากข้อมูลมีหลายส่วน ให้ใช้ Bullet points หรือตาราง เพื่อความชัดเจนและประหยัดพื้นที่
+4. **Constraint:** ห้ามสรุปคำตอบให้สั้นจนเสียเนื้อหาสำคัญ และห้ามตัดจบกลางคันเด็ดขาด
+"""
+CONVERSATION_HISTORY_LIMIT = 4 # ลดประวัติการจำลงเล็กน้อยจาก 6 เหลือ 4 เพื่อประหยัด Token ที่ส่งไปในแต่ละ Request
 
 # ==================== ระบบจำกัดการใช้งาน (Cooldown ต่อ user) ====================
 cooldown_dict = {}
@@ -119,7 +126,7 @@ async def call_ai(user_id, prompt, image_url=None):
                 client_openai.chat.completions.create,
                 model="gemini-2.5-flash",
                 messages=messages,
-                max_tokens=300,  # ตั้งให้ประหยัด token/ค่าใช้จ่าย
+                max_tokens=1500,  # 
                 temperature=0.7
             )
             answer = response.choices[0].message.content

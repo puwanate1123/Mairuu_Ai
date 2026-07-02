@@ -168,7 +168,8 @@ async def ask(interaction: discord.Interaction, *, คำถาม: str):
 
     try:
         answer = await call_ai(คำถาม)
-        await send_answer(interaction.followup.send, answer)
+        formatted = f"**❓ คำถาม:** {คำถาม}\n**🤖 คำตอบ:**\n{answer}"
+        await send_answer(interaction.followup.send, formatted)
     except Exception as e:
         await interaction.followup.send(f"❌ เกิดข้อผิดพลาด: {str(e)}")
 
@@ -178,17 +179,16 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
-    # ถ้ามีการ Mention หรือพิมพ์ !ai
-    is_mention = bot.user in message.mentions
-    is_command = message.content.startswith("!ai")
-    if not (is_mention or is_command):
+    # ไม่ตอบข้อความจากบอทตัวอื่น กันลูปไม่จบ
+    if message.author.bot:
         return
 
-    # ตรวจสอบว่าอยู่ใน channel ที่อนุญาตหรือไม่
+    # ทำงานเฉพาะใน channel ที่กำหนดเท่านั้น (ช่องอื่นเงียบไปเลย ไม่ต้องมีคำสั่งนำหน้า)
     if message.channel.id != ALLOWED_CHANNEL_ID:
-        await message.channel.send(
-            f"🚫 คำสั่งนี้ใช้ได้เฉพาะใน <#{ALLOWED_CHANNEL_ID}> เท่านั้นครับ"
-        )
+        return
+
+    prompt = message.content.strip()
+    if not prompt:
         return
 
     # ตรวจสอบ Cooldown ต่อ user
@@ -200,19 +200,6 @@ async def on_message(message):
     # ตรวจสอบโควตารวมต่อวัน
     if not check_daily_limit():
         await message.channel.send("🚫 วันนี้มีคนใช้บอทครบโควตาแล้ว กรุณาลองใหม่พรุ่งนี้ครับ")
-        return
-
-    # ดึงข้อความจริง (แก้บั๊ก: เดิมลบ mention ได้แค่ตัวสุดท้ายถ้ามีหลาย mention)
-    if is_command:
-        prompt = message.content[4:].strip()
-    else:
-        prompt = message.content
-        for mention in message.mentions:
-            prompt = prompt.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
-        prompt = prompt.strip()
-
-    if not prompt:
-        await message.channel.send("❓ กรุณาพิมพ์คำถามด้วยครับ เช่น `!ai สวัสดี`")
         return
 
     # ตรวจสอบความยาว prompt

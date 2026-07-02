@@ -34,7 +34,7 @@ tree = discord.app_commands.CommandTree(bot)
 
 # ==================== ระบบจำกัดการใช้งาน (Cooldown ต่อ user) ====================
 cooldown_dict = {}
-COOLDOWN_SECONDS = 10  # รอ 10 วินาทีระหว่างแต่ละคำขอของ user คนเดียวกัน
+COOLDOWN_SECONDS = 15  # รอ 15 วินาทีระหว่างแต่ละคำขอของ user คนเดียวกัน
 
 def check_cooldown(user_id):
     current_time = datetime.now().timestamp()
@@ -46,7 +46,11 @@ def check_cooldown(user_id):
     return True, 0
 
 # ==================== ระบบจำกัดจำนวนครั้งรวมต่อวัน (ป้องกันบิล DeepSeek บาน) ====================
-MAX_DAILY_REQUESTS = int(os.getenv('MAX_DAILY_REQUESTS', '300'))  # ปรับได้ผ่าน env var
+MAX_DAILY_REQUESTS = int(os.getenv('MAX_DAILY_REQUESTS', '100'))  # ปรับได้ผ่าน env var
+
+# ==================== จำกัดให้บอทตอบได้แค่ channel เดียว ====================
+# https://discord.com/channels/<guild_id>/<channel_id> -> เอาเลขท้ายสุด (channel_id) มาใส่
+ALLOWED_CHANNEL_ID = int(os.getenv('ALLOWED_CHANNEL_ID', '1522145630062117016'))
 _daily_usage = {"date": date.today(), "count": 0}
 
 def check_daily_limit():
@@ -67,12 +71,12 @@ async def call_deepseek(prompt):
     try:
         response = await asyncio.to_thread(
             client_openai.chat.completions.create,
-            model="deepseek-chat",
+            model="deepseek-v4-flash",
             messages=[
                 {"role": "system", "content": "คุณคือผู้ช่วยที่มีประโยชน์ ตอบอย่างสุภาพและเป็นมิตร ใช้ภาษาไทยให้เหมาะสม"},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=500,  # ตั้งให้ประหยัด
+            max_tokens=300,  # ตั้งให้ประหยัด token/ค่าใช้จ่าย
             temperature=0.7
         )
         return response.choices[0].message.content
@@ -126,6 +130,14 @@ async def on_ready():
 async def ask(interaction: discord.Interaction, *, คำถาม: str):
     """คำสั่ง /ask <ข้อความ>"""
 
+    # ตรวจสอบว่าอยู่ใน channel ที่อนุญาตหรือไม่
+    if interaction.channel_id != ALLOWED_CHANNEL_ID:
+        await interaction.response.send_message(
+            f"🚫 คำสั่งนี้ใช้ได้เฉพาะใน <#{ALLOWED_CHANNEL_ID}> เท่านั้นครับ",
+            ephemeral=True
+        )
+        return
+
     # ตรวจสอบ Cooldown ต่อ user
     can_use, wait_time = check_cooldown(interaction.user.id)
     if not can_use:
@@ -170,6 +182,13 @@ async def on_message(message):
     is_mention = bot.user in message.mentions
     is_command = message.content.startswith("!ai")
     if not (is_mention or is_command):
+        return
+
+    # ตรวจสอบว่าอยู่ใน channel ที่อนุญาตหรือไม่
+    if message.channel.id != ALLOWED_CHANNEL_ID:
+        await message.channel.send(
+            f"🚫 คำสั่งนี้ใช้ได้เฉพาะใน <#{ALLOWED_CHANNEL_ID}> เท่านั้นครับ"
+        )
         return
 
     # ตรวจสอบ Cooldown ต่อ user

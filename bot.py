@@ -1,8 +1,10 @@
 import discord
+from discord import app_commands
 import openai
 import os
 import asyncio
 import tempfile
+from collections import deque
 from datetime import datetime, date
 from aiohttp import web
 
@@ -12,7 +14,6 @@ from aiohttp import web
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-# ตรวจสอบว่ามีการตั้งค่าหรือไม่
 if not DISCORD_TOKEN:
     raise ValueError("❌ ไม่พบ DISCORD_TOKEN ใน Environment Variables")
 if not GEMINI_API_KEY:
@@ -32,9 +33,23 @@ intents.members = True
 bot = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(bot)
 
+# ==================== ค่าตั้งต้น (ปรับได้ผ่าน env var หรือคำสั่ง /config แบบ real-time) ====================
+COOLDOWN_SECONDS = int(os.getenv('COOLDOWN_SECONDS', '15'))       # วินาทีระหว่างคำขอของ user คนเดียวกัน
+MAX_DAILY_REQUESTS = int(os.getenv('MAX_DAILY_REQUESTS', '100'))  # โควตารวมทั้งบอท/วัน
+MAX_PROMPT_LENGTH = int(os.getenv('MAX_PROMPT_LENGTH', '1000'))   # ความยาวคำถามสูงสุด
+MIN_PROMPT_LENGTH = int(os.getenv('MIN_PROMPT_LENGTH', '3'))      # ข้อความสั้นกว่านี้ (พิมพ์ตรงๆ) จะไม่ยิงเข้า AI
+
+# https://discord.com/channels/<guild_id>/<channel_id> -> เอาเลขท้ายสุด (channel_id) มาใส่
+ALLOWED_CHANNEL_ID = int(os.getenv('ALLOWED_CHANNEL_ID', '1522145630062117016'))
+
+# ใส่ role ID ถ้าอยากจำกัดให้ใช้ได้เฉพาะคนมี role นี้ / ปล่อยเป็น 0 = ใช้ได้ทุกคนในช่อง
+ALLOWED_ROLE_ID = int(os.getenv('ALLOWED_ROLE_ID', '0'))
+
+SYSTEM_PROMPT = "คุณคือผู้ช่วยที่มีประโยชน์ ตอบอย่างสุภาพและเป็นมิตร ใช้ภาษาไทยให้เหมาะสม"
+CONVERSATION_HISTORY_LIMIT = 6  # เก็บย้อนหลัง 3 คู่ (user+assistant) ต่อคน
+
 # ==================== ระบบจำกัดการใช้งาน (Cooldown ต่อ user) ====================
 cooldown_dict = {}
-COOLDOWN_SECONDS = 15  # รอ 15 วินาทีระหว่างแต่ละคำขอของ user คนเดียวกัน
 
 def check_cooldown(user_id):
     current_time = datetime.now().timestamp()
@@ -45,12 +60,7 @@ def check_cooldown(user_id):
     cooldown_dict[user_id] = current_time
     return True, 0
 
-# ==================== ระบบจำกัดจำนวนครั้งรวมต่อวัน (ป้องกันชนโควตาฟรี) ====================
-MAX_DAILY_REQUESTS = int(os.getenv('MAX_DAILY_REQUESTS', '100'))  # ปรับได้ผ่าน env var
-
-# ==================== จำกัดให้บอทตอบได้แค่ channel เดียว ====================
-# https://discord.com/channels/<guild_id>/<channel_id> -> เอาเลขท้ายสุด (channel_id) มาใส่
-ALLOWED_CHANNEL_ID = int(os.getenv('ALLOWED_CHANNEL_ID', '1522145630062117016'))
+# ==================== ระบบจำกัดจำนวนครั้งรวมต่อวัน ====================
 _daily_usage = {"date": date.today(), "count": 0}
 
 def check_daily_limit():
@@ -63,33 +73,82 @@ def check_daily_limit():
     _daily_usage["count"] += 1
     return True
 
-# ==================== จำกัดความยาว prompt (ป้องกันคนยิง prompt ยาวเกินจำเป็น) ====================
-MAX_PROMPT_LENGTH = int(os.getenv('MAX_PROMPT_LENGTH', '1000'))
+# ==================== สิทธิ์การใช้งานตาม Role (ถ้าตั้งไว้) ====================
+def has_role_permission(author) -> bool:
+    if ALLOWED_ROLE_ID == 0:
+        return True
+    if not isinstance(author, discord.Member):
+        return False
+    return any(role.id == ALLOWED_ROLE_ID for role in author.roles)
 
-# ==================== ฟังก์ชันเรียก Gemini ====================
-async def call_ai(prompt):
-    try:
-        response = await asyncio.to_thread(
-            client_openai.chat.completions.create,
-            model="gemini-2.5-flash",
-            messages=[
-                {"role": "system", "content": "คุณคือผู้ช่วยที่มีประโยชน์ ตอบอย่างสุภาพและเป็นมิตร ใช้ภาษาไทยให้เหมาะสม"},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=300,  # ตั้งให้ประหยัด token/ค่าใช้จ่าย
-            temperature=0.7
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"❌ เกิดข้อผิดพลาด: {str(e)}"
+# ==================== เก็บบทสนทนาต่อเนื่องต่อคน (อยู่ใน memory เท่านั้น) ====================
+conversation_history = {}  # user_id -> deque[{"role":..,"content":..}]
 
-# ==================== ฟังก์ชันช่วยส่งคำตอบ (แก้ race condition ของไฟล์) ====================
-async def send_answer(send_func, answer):
-    """
-    send_func: async callable ที่รับ text= หรือ file= (interaction.followup.send หรือ channel.send)
-    ใช้ tempfile ที่ชื่อไม่ซ้ำกัน กัน 2 คนถามพร้อมกันแล้วไฟล์ทับกัน
-    """
-    if len(answer) > 2000:
+# ==================== ข้อความ error ที่เข้าใจง่าย ====================
+ERROR_MESSAGES = {
+    "rate_limit": "🚦 ตอนนี้มีคนใช้เยอะ (โดน rate limit จาก Gemini) กรุณาลองใหม่อีกสักครู่ครับ",
+    "temporary": "⚠️ เชื่อมต่อ AI ไม่สำเร็จชั่วคราว กรุณาลองใหม่อีกครั้งครับ",
+}
+
+def format_error(error_code):
+    return ERROR_MESSAGES.get(error_code, f"❌ เกิดข้อผิดพลาด: {error_code}")
+
+# ==================== ฟังก์ชันเรียก Gemini (รองรับรูปภาพ + จำบทสนทนา + retry) ====================
+async def call_ai(user_id, prompt, image_url=None):
+    history = conversation_history.setdefault(
+        user_id, deque(maxlen=CONVERSATION_HISTORY_LIMIT)
+    )
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
+
+    if image_url:
+        user_content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+    else:
+        user_content = prompt
+    messages.append({"role": "user", "content": user_content})
+
+    max_retries = 2
+    last_error = "temporary"
+    for attempt in range(max_retries + 1):
+        try:
+            response = await asyncio.to_thread(
+                client_openai.chat.completions.create,
+                model="gemini-2.5-flash",
+                messages=messages,
+                max_tokens=300,  # ตั้งให้ประหยัด token/ค่าใช้จ่าย
+                temperature=0.7
+            )
+            answer = response.choices[0].message.content
+            # เก็บบทสนทนาไว้คุยต่อ (เก็บแค่ข้อความ ไม่เก็บรูป กันประวัติบวมเร็วเกินไป)
+            history.append({"role": "user", "content": prompt})
+            history.append({"role": "assistant", "content": answer})
+            return answer, None
+        except openai.RateLimitError:
+            last_error = "rate_limit"
+            if attempt < max_retries:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+        except (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError):
+            last_error = "temporary"
+            if attempt < max_retries:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+        except Exception as e:
+            return None, str(e)
+
+    return None, last_error
+
+# ==================== ฟังก์ชันช่วยส่งคำตอบแบบ Embed (แก้ race condition ของไฟล์) ====================
+async def send_ai_response(send_func, answer, question=None):
+    embed = discord.Embed(color=discord.Color.blurple())
+    if question:
+        embed.add_field(name="❓ คำถาม", value=question[:1024], inline=False)
+
+    if len(answer) > 4000:
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -97,15 +156,14 @@ async def send_answer(send_func, answer):
             ) as f:
                 f.write(answer)
                 tmp_path = f.name
-            await send_func(
-                content="📄 คำตอบยาวเกินไป ส่งเป็นไฟล์ให้ครับ:",
-                file=discord.File(tmp_path, filename="answer.txt")
-            )
+            embed.add_field(name="🤖 คำตอบ", value="คำตอบยาวเกินไป ส่งเป็นไฟล์แนบให้ครับ 👇", inline=False)
+            await send_func(embed=embed, file=discord.File(tmp_path, filename="answer.txt"))
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
     else:
-        await send_func(content=answer)
+        embed.add_field(name="🤖 คำตอบ", value=answer, inline=False)
+        await send_func(embed=embed)
 
 # ==================== Event: Bot พร้อมใช้งาน ====================
 @bot.event
@@ -113,11 +171,9 @@ async def on_ready():
     print(f'✅ บอท {bot.user} พร้อมใช้งานแล้ว!')
     print(f'📊 กำลังเชื่อมต่อกับ {len(bot.guilds)} เซิร์ฟเวอร์')
 
-    # ซิงค์ Slash Command
     await tree.sync()
     print("✅ Slash Commands ซิงค์เรียบร้อย")
 
-    # ตั้งสถานะให้ Bot
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
@@ -125,12 +181,87 @@ async def on_ready():
         )
     )
 
-# ==================== Slash Command: /ask ====================
-@tree.command(name="ask", description="ถาม Gemini AI")
-async def ask(interaction: discord.Interaction, *, คำถาม: str):
-    """คำสั่ง /ask <ข้อความ>"""
+# ==================== Slash Command: /help ====================
+@tree.command(name="help", description="วิธีใช้งานบอท AI")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(title="📖 วิธีใช้งานบอท", color=discord.Color.green())
+    embed.add_field(
+        name="💬 พิมพ์ถามตรงๆ",
+        value=f"พิมพ์คำถามได้เลยใน <#{ALLOWED_CHANNEL_ID}> ไม่ต้องมีคำสั่งนำหน้า บอทตอบทันที",
+        inline=False
+    )
+    embed.add_field(
+        name="/ask",
+        value="ถามผ่าน slash command แนบรูปได้ (เห็นทั้งคำถามและคำตอบในข้อความเดียว)",
+        inline=False
+    )
+    embed.add_field(name="/reset", value="ล้างบทสนทนาที่คุยกับ AI ไว้ (เริ่มคุยใหม่)", inline=False)
+    embed.add_field(name="/help", value="แสดงข้อความนี้", inline=False)
+    if ALLOWED_ROLE_ID:
+        embed.add_field(
+            name="🔒 สิทธิ์การใช้งาน",
+            value=f"ต้องมี role <@&{ALLOWED_ROLE_ID}> ถึงจะใช้บอทได้",
+            inline=False
+        )
+    embed.add_field(
+        name="⚙️ ขีดจำกัดปัจจุบัน",
+        value=(
+            f"Cooldown: `{COOLDOWN_SECONDS}` วินาที/คน\n"
+            f"ความยาวคำถามสูงสุด: `{MAX_PROMPT_LENGTH}` ตัวอักษร\n"
+            f"โควตารวม/วัน: `{MAX_DAILY_REQUESTS}` ครั้ง"
+        ),
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # ตรวจสอบว่าอยู่ใน channel ที่อนุญาตหรือไม่
+# ==================== Slash Command: /reset ====================
+@tree.command(name="reset", description="ล้างบทสนทนาที่คุยกับ AI ไว้ (เริ่มคุยใหม่)")
+async def reset_cmd(interaction: discord.Interaction):
+    conversation_history.pop(interaction.user.id, None)
+    await interaction.response.send_message("🔄 ล้างบทสนทนาก่อนหน้าแล้วครับ เริ่มคุยใหม่ได้เลย", ephemeral=True)
+
+# ==================== Slash Command: /config (เฉพาะแอดมิน) ====================
+@tree.command(name="config", description="[Admin] ปรับค่าลิมิตของบอทแบบ real-time")
+@app_commands.describe(setting="ตัวเลือกที่จะปรับ", value="ค่าใหม่ (ตัวเลข)")
+@app_commands.choices(setting=[
+    app_commands.Choice(name="Cooldown (วินาที/คน)", value="cooldown"),
+    app_commands.Choice(name="โควตารวมต่อวัน (ครั้ง)", value="daily"),
+    app_commands.Choice(name="ความยาวคำถามสูงสุด (ตัวอักษร)", value="prompt_max"),
+    app_commands.Choice(name="ความยาวคำถามต่ำสุดที่จะตอบ (ตัวอักษร)", value="prompt_min"),
+])
+async def config_cmd(interaction: discord.Interaction, setting: app_commands.Choice[str], value: int):
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("🚫 คำสั่งนี้ใช้ได้เฉพาะแอดมินเซิร์ฟเวอร์เท่านั้นครับ", ephemeral=True)
+        return
+
+    global COOLDOWN_SECONDS, MAX_DAILY_REQUESTS, MAX_PROMPT_LENGTH, MIN_PROMPT_LENGTH
+
+    if value < 0:
+        await interaction.response.send_message("⚠️ ค่าต้องเป็นตัวเลขที่ไม่ติดลบครับ", ephemeral=True)
+        return
+
+    if setting.value == "cooldown":
+        COOLDOWN_SECONDS = value
+    elif setting.value == "daily":
+        MAX_DAILY_REQUESTS = value
+    elif setting.value == "prompt_max":
+        MAX_PROMPT_LENGTH = value
+    elif setting.value == "prompt_min":
+        MIN_PROMPT_LENGTH = value
+
+    await interaction.response.send_message(
+        f"✅ ตั้งค่า **{setting.name}** เป็น `{value}` แล้ว\n"
+        "⚠️ ค่านี้จะหายไปถ้าบอท restart (เช่น Render sleep/deploy ใหม่) "
+        "ถ้าอยากให้ค่าคงอยู่ถาวร ให้ไปตั้ง env var บน Render ด้วย",
+        ephemeral=True
+    )
+
+# ==================== Slash Command: /ask ====================
+@tree.command(name="ask", description="ถาม Gemini AI (แนบรูปได้)")
+@app_commands.describe(คำถาม="คำถามของคุณ", รูปภาพ="แนบรูปเพื่อถามเกี่ยวกับรูป (ไม่บังคับ)")
+async def ask(interaction: discord.Interaction, คำถาม: str, รูปภาพ: discord.Attachment = None):
+    """คำสั่ง /ask <ข้อความ> [แนบรูป]"""
+
     if interaction.channel_id != ALLOWED_CHANNEL_ID:
         await interaction.response.send_message(
             f"🚫 คำสั่งนี้ใช้ได้เฉพาะใน <#{ALLOWED_CHANNEL_ID}> เท่านั้นครับ",
@@ -138,7 +269,13 @@ async def ask(interaction: discord.Interaction, *, คำถาม: str):
         )
         return
 
-    # ตรวจสอบ Cooldown ต่อ user
+    if not has_role_permission(interaction.user):
+        await interaction.response.send_message(
+            f"🚫 คุณไม่มีสิทธิ์ใช้คำสั่งนี้ ต้องมี role <@&{ALLOWED_ROLE_ID}> ครับ",
+            ephemeral=True
+        )
+        return
+
     can_use, wait_time = check_cooldown(interaction.user.id)
     if not can_use:
         await interaction.response.send_message(
@@ -147,7 +284,6 @@ async def ask(interaction: discord.Interaction, *, คำถาม: str):
         )
         return
 
-    # ตรวจสอบโควตารวมต่อวัน
     if not check_daily_limit():
         await interaction.response.send_message(
             "🚫 วันนี้มีคนใช้บอทครบโควตาแล้ว กรุณาลองใหม่พรุ่งนี้ครับ",
@@ -155,7 +291,6 @@ async def ask(interaction: discord.Interaction, *, คำถาม: str):
         )
         return
 
-    # ตรวจสอบความยาว prompt
     if len(คำถาม) > MAX_PROMPT_LENGTH:
         await interaction.response.send_message(
             f"⚠️ ข้อความยาวเกินไป (สูงสุด {MAX_PROMPT_LENGTH} ตัวอักษร)",
@@ -163,58 +298,70 @@ async def ask(interaction: discord.Interaction, *, คำถาม: str):
         )
         return
 
-    # แสดงสถานะกำลังคิด
+    image_url = None
+    if รูปภาพ is not None and รูปภาพ.content_type and รูปภาพ.content_type.startswith("image/"):
+        image_url = รูปภาพ.url
+
     await interaction.response.defer()
 
-    try:
-        answer = await call_ai(คำถาม)
-        formatted = f"**❓ คำถาม:** {คำถาม}\n**🤖 คำตอบ:**\n{answer}"
-        await send_answer(interaction.followup.send, formatted)
-    except Exception as e:
-        await interaction.followup.send(f"❌ เกิดข้อผิดพลาด: {str(e)}")
+    answer, error = await call_ai(interaction.user.id, คำถาม, image_url)
+    if error:
+        await interaction.followup.send(format_error(error))
+        return
 
-# ==================== Event: รับข้อความในแชท ====================
+    await send_ai_response(interaction.followup.send, answer, question=คำถาม)
+
+# ==================== Event: รับข้อความในแชท (พิมพ์ตรงๆ ไม่ต้องใช้คำสั่ง) ====================
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
-
-    # ไม่ตอบข้อความจากบอทตัวอื่น กันลูปไม่จบ
     if message.author.bot:
-        return
-
-    # ทำงานเฉพาะใน channel ที่กำหนดเท่านั้น (ช่องอื่นเงียบไปเลย ไม่ต้องมีคำสั่งนำหน้า)
+        return  # ไม่ตอบข้อความจากบอทตัวอื่น กันลูปไม่จบ
     if message.channel.id != ALLOWED_CHANNEL_ID:
-        return
+        return  # ช่องอื่นเงียบไปเลย ไม่ต้องมีคำสั่งนำหน้า
+
+    if not has_role_permission(message.author):
+        return  # เงียบ ไม่แจ้งเตือนกันสแปม (ต่างจาก /ask ที่แจ้งเพราะเป็นความตั้งใจชัดเจนกว่า)
 
     prompt = message.content.strip()
-    if not prompt:
+
+    image_url = None
+    for att in message.attachments:
+        if att.content_type and att.content_type.startswith("image/"):
+            image_url = att.url
+            break
+
+    if not prompt and not image_url:
+        return
+    if not prompt and image_url:
+        prompt = "อธิบายรูปนี้ให้หน่อยครับ"
+
+    # กรองข้อความสั้นเกินไป (กันคนพิมพ์ "ok" "555" แล้วเปลือง token) ยกเว้นแนบรูปมาด้วย
+    if image_url is None and len(prompt) < MIN_PROMPT_LENGTH:
         return
 
-    # ตรวจสอบ Cooldown ต่อ user
     can_use, wait_time = check_cooldown(message.author.id)
     if not can_use:
         await message.channel.send(f"⏳ โปรดรอ {wait_time} วินาที")
         return
 
-    # ตรวจสอบโควตารวมต่อวัน
     if not check_daily_limit():
         await message.channel.send("🚫 วันนี้มีคนใช้บอทครบโควตาแล้ว กรุณาลองใหม่พรุ่งนี้ครับ")
         return
 
-    # ตรวจสอบความยาว prompt
     if len(prompt) > MAX_PROMPT_LENGTH:
         await message.channel.send(f"⚠️ ข้อความยาวเกินไป (สูงสุด {MAX_PROMPT_LENGTH} ตัวอักษร)")
         return
 
-    # แสดงสถานะกำลังพิมพ์
     async with message.channel.typing():
-        answer = await call_ai(prompt)
-        await send_answer(message.channel.send, answer)
+        answer, error = await call_ai(message.author.id, prompt, image_url)
+        if error:
+            await message.channel.send(format_error(error))
+            return
+        await send_ai_response(message.channel.send, answer)
 
 # ==================== HTTP server เล็กๆ ให้ Render มองว่าเป็น Web Service ====================
-# Render free tier ต้อง bind กับ $PORT ถึงจะยอมรันเป็น Web Service (ฟรี)
-# ถ้าไม่มี endpoint นี้ Render จะมองว่า service ไม่ตอบสนองและ deploy ไม่ผ่าน
 async def handle_ping(request):
     return web.Response(text="✅ Discord bot is running")
 

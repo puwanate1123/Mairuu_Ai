@@ -55,7 +55,7 @@ SYSTEM_PROMPT = """
 3. **Structured:** หากข้อมูลมีหลายส่วน ให้ใช้ Bullet points หรือตาราง เพื่อความชัดเจนและประหยัดพื้นที่
 4. **Constraint:** ห้ามสรุปคำตอบให้สั้นจนเสียเนื้อหาสำคัญ และห้ามตัดจบกลางคันเด็ดขาด
 """
-CONVERSATION_HISTORY_LIMIT = 4 
+CONVERSATION_HISTORY_LIMIT = 6
 
 # ==================== ระบบจำกัดการใช้งาน ====================
 cooldown_dict = {}

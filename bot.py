@@ -178,13 +178,15 @@ async def send_ai_response(send_func, answer, question=None):
             ) as f:
                 f.write(answer)
                 tmp_path = f.name
-            embed.add_field(name="🤖 คำตอบ", value="คำตอบยาวเกินไป ส่งเป็นไฟล์แนบให้ครับ 👇", inline=False)
+            # แก้ไขจุดนี้: เปลี่ยนจาก add_field เป็น description เพื่อความปลอดภัยและเป็นระบบเดียวกัน
+            embed.description = "🤖 **คำตอบ:**\nคำตอบยาวเกินไป ส่งเป็นไฟล์แนบให้ครับ 👇"
             await send_func(embed=embed, file=discord.File(tmp_path, filename="answer.txt"))
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
     else:
-        embed.add_field(name="🤖 คำตอบ", value=answer, inline=False)
+        # 🔥 [แก้ไขจุดนี้ที่เป็นปัญหา] ย้ายคำตอบมาใส่ใน description เพื่อให้รองรับข้อความยาวได้ถึง 4,000 ตัวอักษร โดยไม่แครชจากข้อจำกัด 1,024 ตัวอักษรของ add_field
+        embed.description = f"🤖 **คำตอบ:**\n\n{answer}"
         await send_func(embed=embed)
 
 # ==================== Event: Bot พร้อมใช้งาน ====================

@@ -10,18 +10,18 @@ from aiohttp import web
 # IMPORTANT: ห้ามใส่ Token ตรงนี้เด็ดขาด!
 # Render จะ inject ค่าให้อัตโนมัติจาก Environment Variables
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 # ตรวจสอบว่ามีการตั้งค่าหรือไม่
 if not DISCORD_TOKEN:
     raise ValueError("❌ ไม่พบ DISCORD_TOKEN ใน Environment Variables")
-if not DEEPSEEK_API_KEY:
-    raise ValueError("❌ ไม่พบ DEEPSEEK_API_KEY ใน Environment Variables")
+if not GEMINI_API_KEY:
+    raise ValueError("❌ ไม่พบ GEMINI_API_KEY ใน Environment Variables")
 
-# ==================== ตั้งค่า OpenAI Client ====================
+# ==================== ตั้งค่า Gemini ผ่าน OpenAI-compatible endpoint ====================
 client_openai = openai.OpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com/v1"
+    api_key=GEMINI_API_KEY,
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 
 # ==================== ตั้งค่า Discord Intents ====================
@@ -45,7 +45,7 @@ def check_cooldown(user_id):
     cooldown_dict[user_id] = current_time
     return True, 0
 
-# ==================== ระบบจำกัดจำนวนครั้งรวมต่อวัน (ป้องกันบิล DeepSeek บาน) ====================
+# ==================== ระบบจำกัดจำนวนครั้งรวมต่อวัน (ป้องกันชนโควตาฟรี) ====================
 MAX_DAILY_REQUESTS = int(os.getenv('MAX_DAILY_REQUESTS', '100'))  # ปรับได้ผ่าน env var
 
 # ==================== จำกัดให้บอทตอบได้แค่ channel เดียว ====================
@@ -66,12 +66,12 @@ def check_daily_limit():
 # ==================== จำกัดความยาว prompt (ป้องกันคนยิง prompt ยาวเกินจำเป็น) ====================
 MAX_PROMPT_LENGTH = int(os.getenv('MAX_PROMPT_LENGTH', '1000'))
 
-# ==================== ฟังก์ชันเรียก DeepSeek ====================
-async def call_deepseek(prompt):
+# ==================== ฟังก์ชันเรียก Gemini ====================
+async def call_ai(prompt):
     try:
         response = await asyncio.to_thread(
             client_openai.chat.completions.create,
-            model="deepseek-v4-flash",
+            model="gemini-2.5-flash",
             messages=[
                 {"role": "system", "content": "คุณคือผู้ช่วยที่มีประโยชน์ ตอบอย่างสุภาพและเป็นมิตร ใช้ภาษาไทยให้เหมาะสม"},
                 {"role": "user", "content": prompt}
@@ -126,7 +126,7 @@ async def on_ready():
     )
 
 # ==================== Slash Command: /ask ====================
-@tree.command(name="ask", description="ถาม DeepSeek AI")
+@tree.command(name="ask", description="ถาม Gemini AI")
 async def ask(interaction: discord.Interaction, *, คำถาม: str):
     """คำสั่ง /ask <ข้อความ>"""
 
@@ -167,7 +167,7 @@ async def ask(interaction: discord.Interaction, *, คำถาม: str):
     await interaction.response.defer()
 
     try:
-        answer = await call_deepseek(คำถาม)
+        answer = await call_ai(คำถาม)
         await send_answer(interaction.followup.send, answer)
     except Exception as e:
         await interaction.followup.send(f"❌ เกิดข้อผิดพลาด: {str(e)}")
@@ -222,7 +222,7 @@ async def on_message(message):
 
     # แสดงสถานะกำลังพิมพ์
     async with message.channel.typing():
-        answer = await call_deepseek(prompt)
+        answer = await call_ai(prompt)
         await send_answer(message.channel.send, answer)
 
 # ==================== HTTP server เล็กๆ ให้ Render มองว่าเป็น Web Service ====================

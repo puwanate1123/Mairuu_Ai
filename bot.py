@@ -13,16 +13,24 @@ from aiohttp import web
 # Render จะ inject ค่าให้อัตโนมัติจาก Environment Variables
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY') # เพิ่มการโหลดคีย์ของ Groq
 
 if not DISCORD_TOKEN:
     raise ValueError("❌ ไม่พบ DISCORD_TOKEN ใน Environment Variables")
 if not GEMINI_API_KEY:
     raise ValueError("❌ ไม่พบ GEMINI_API_KEY ใน Environment Variables")
+if not GROQ_API_KEY:
+    raise ValueError("❌ ไม่พบ GROQ_API_KEY ใน Environment Variables")
 
-# ==================== ตั้งค่า Gemini ผ่าน OpenAI-compatible endpoint ====================
-client_openai = openai.OpenAI(
+# ==================== ตั้งค่า AI Clients (Gemini & Groq) ====================
+client_gemini = openai.OpenAI(
     api_key=GEMINI_API_KEY,
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+)
+
+client_groq = openai.OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
 )
 
 # ==================== ตั้งค่า Discord Intents ====================
@@ -93,14 +101,14 @@ conversation_history = {}  # user_id -> deque[{"role":..,"content":..}]
 
 # ==================== ข้อความ error ที่เข้าใจง่าย ====================
 ERROR_MESSAGES = {
-    "rate_limit": "🚦 ตอนนี้มีคนใช้เยอะ (โดน rate limit จาก Gemini) กรุณาลองใหม่อีกสักครู่ครับ",
+    "rate_limit": "🚦 ตอนนี้มีคนใช้เยอะ (โดน rate limit จาก AI ทั้งหมด) กรุณาลองใหม่อีกสักครู่ครับ",
     "temporary": "⚠️ เชื่อมต่อ AI ไม่สำเร็จชั่วคราว กรุณาลองใหม่อีกครั้งครับ",
 }
 
 def format_error(error_code):
     return ERROR_MESSAGES.get(error_code, f"❌ เกิดข้อผิดพลาด: {error_code}")
 
-# ==================== ฟังก์ชันเรียก Gemini (รองรับรูปภาพ + จำบทสนทนา + retry) ====================
+# ==================== ฟังก์ชันเรียก AI (สลับอัตโนมัติเมื่อตัวหลักโควตาหมด/พัง) ====================
 async def call_ai(user_id, prompt, image_url=None):
     history = conversation_history.setdefault(
         user_id, deque(maxlen=CONVERSATION_HISTORY_LIMIT)
@@ -118,34 +126,41 @@ async def call_ai(user_id, prompt, image_url=None):
         user_content = prompt
     messages.append({"role": "user", "content": user_content})
 
-    max_retries = 2
+    # สลับโมเดล Groq อัตโนมัติ: ถ้ามีรูปให้ใช้โมเดล Vision ถ้าเป็นข้อความล้วนใช้ Llama 3.3
+    groq_model = "llama-3.2-11b-vision-preview" if image_url else "llama-3.3-70b-versatile"
+
+    # จัดลำดับการเรียกใช้งาน: ใช้ Gemini ก่อน ถ้ามีปัญหาจะกระโดดไปใช้ Groq ทันที
+    providers = [
+        {"client": client_gemini, "model": "gemini-2.5-flash", "name": "Gemini"},
+        {"client": client_groq, "model": groq_model, "name": "Groq"}
+    ]
+
     last_error = "temporary"
-    for attempt in range(max_retries + 1):
+    
+    for p in providers:
         try:
             response = await asyncio.to_thread(
-                client_openai.chat.completions.create,
-                model="gemini-2.5-flash",
+                p["client"].chat.completions.create,
+                model=p["model"],
                 messages=messages,
-                max_tokens=1500,  # 
+                max_tokens=1500,  # ตั้งไว้ 1500 เพื่อให้ตอบได้ยาวครอบคลุม ไม่ขาดตอน
                 temperature=0.7
             )
             answer = response.choices[0].message.content
-            # เก็บบทสนทนาไว้คุยต่อ (เก็บแค่ข้อความ ไม่เก็บรูป กันประวัติบวมเร็วเกินไป)
+            
+            # เก็บบทสนทนาไว้คุยต่อ
             history.append({"role": "user", "content": prompt})
             history.append({"role": "assistant", "content": answer})
             return answer, None
+            
         except openai.RateLimitError:
+            print(f"🚦 {p['name']} ติด Rate Limit / โควตาเต็ม กำลังสลับไปตัวถัดไป...")
             last_error = "rate_limit"
-            if attempt < max_retries:
-                await asyncio.sleep(2 * (attempt + 1))
-                continue
-        except (openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError):
-            last_error = "temporary"
-            if attempt < max_retries:
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
+            continue
         except Exception as e:
-            return None, str(e)
+            print(f"⚠️ {p['name']} เกิดข้อผิดพลาด: {e} | กำลังสลับไปตัวถัดไป...")
+            last_error = "temporary"
+            continue
 
     return None, last_error
 
